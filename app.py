@@ -3,9 +3,10 @@ import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
 import colorsys
+import json  # 修复了之前的 NameError
 
 # ==========================================
-# 1. 核心逻辑函数
+# 1. 核心算法 (升级版)
 # ==========================================
 
 def hex_to_rgb(hex_code):
@@ -15,61 +16,74 @@ def hex_to_rgb(hex_code):
 def rgb_to_hex(rgb):
     return '#{:02x}{:02x}{:02x}'.format(*rgb)
 
-def extract_colors_kmeans(image, n_colors=7, ignore_dull=False):
+def extract_smart_colors(image, n_colors=7, min_sat=0.1, min_val=0.1):
     """
-    使用 K-Means 聚类算法从图片中提取主色调
-    修复了 numpy 报错，并增加了智能过滤
+    智能提取：
+    1. 转为 HSV 空间
+    2. 根据阈值剔除 低饱和度(灰/白) 和 低亮度(黑) 的像素
+    3. 对剩余的鲜艳像素进行聚类
     """
-    # 缩放图片以提高计算速度
-    img_small = image.resize((150, 150))
+    # 缩放以加速
+    img_small = image.resize((200, 200)) 
     ar = np.asarray(img_small)
-    shape = ar.shape
     
-    # 去除 Alpha 通道
-    if len(shape) == 3 and shape[2] > 3:
+    # 丢弃 Alpha 通道
+    if len(ar.shape) == 3 and ar.shape[2] > 3:
         ar = ar[:, :, :3]
     
-    # 修复 numpy 报错：使用 -1 自动计算维度
+    # 展平
     ar = ar.reshape(-1, 3)
     
-    # 智能过滤：如果开启，先剔除极度灰暗或过白的像素 (简单的预处理)
-    if ignore_dull:
-        # 转 HSV 判断饱和度(S)和亮度(V)
-        # 这里用简化的逻辑：RGB方差太小说明是灰色
-        std_dev = np.std(ar, axis=1)
-        # 保留色彩差异够大的像素 (阈值可调，设为10)
-        ar = ar[std_dev > 10]
-        if len(ar) < n_colors: # 如果过滤太狠，就回退
-            ar = np.asarray(img_small).reshape(-1, 3)
-
-    # 聚类
-    if len(ar) > n_colors:
-        kmeans = KMeans(n_clusters=n_colors, n_init=5, max_iter=200)
-        kmeans.fit(ar)
-        colors = kmeans.cluster_centers_
-    else:
-        colors = ar[:n_colors]
+    # --- 智能过滤核心 ---
+    # 将 RGB 归一化到 0-1 并转 HSV
+    # 向量化计算有点复杂，这里用列表推导式做预筛选 (为了代码稳健性)
+    valid_pixels = []
     
-    # 转为 Hex 列表返回
-    hex_colors = [rgb_to_hex(tuple(map(int, c))) for c in colors]
-    return hex_colors
+    # 为了速度，随机采样 5000 个像素进行判断，而不是全部
+    if len(ar) > 5000:
+        indices = np.random.choice(len(ar), 5000, replace=False)
+        sample_ar = ar[indices]
+    else:
+        sample_ar = ar
 
-def auto_sort_colors(hex_colors, method):
-    """根据规则自动排序"""
+    for pixel in sample_ar:
+        r, g, b = pixel
+        h, s, v = colorsys.rgb_to_hsv(r/255.0, g/255.0, b/255.0)
+        # 过滤掉 饱和度 < min_sat (去除灰/白) 或 亮度 < min_val (去除黑)
+        if s >= min_sat and v >= min_val:
+            valid_pixels.append(pixel)
+    
+    # 如果过滤完没剩多少颜色（比如是一张全黑白的图），就回退到原始数据
+    if len(valid_pixels) < n_colors:
+        valid_pixels = sample_ar
+    
+    valid_pixels = np.array(valid_pixels)
+
+    # --- K-Means 聚类 ---
+    kmeans = KMeans(n_clusters=n_colors, n_init=5, max_iter=200)
+    kmeans.fit(valid_pixels)
+    colors = kmeans.cluster_centers_
+    
+    return [rgb_to_hex(tuple(map(int, c))) for c in colors]
+
+def sort_palette(hex_colors, mode):
+    """快速排序工具"""
     rgb_colors = [hex_to_rgb(c) for c in hex_colors]
     
-    if method == "亮度 (暗 -> 亮)":
+    if mode == "brightness_asc": # 暗 -> 亮
         rgb_sorted = sorted(rgb_colors, key=lambda c: c[0]*0.299 + c[1]*0.587 + c[2]*0.114)
-    elif method == "亮度 (亮 -> 暗)":
+    elif mode == "brightness_desc": # 亮 -> 暗
         rgb_sorted = sorted(rgb_colors, key=lambda c: c[0]*0.299 + c[1]*0.587 + c[2]*0.114, reverse=True)
-    elif method == "色相 (光谱顺序)":
+    elif mode == "hue": # 色相排序 (彩虹)
         rgb_sorted = sorted(rgb_colors, key=lambda c: colorsys.rgb_to_hsv(c[0]/255, c[1]/255, c[2]/255)[0])
+    elif mode == "reverse":
+        return hex_colors[::-1]
     else:
-        return hex_colors # 不排序
-        
+        return hex_colors
+
     return [rgb_to_hex(c) for c in rgb_sorted]
 
-def generate_clr_content(hex_colors):
+def generate_clr(hex_colors):
     content = ""
     for idx, hex_code in enumerate(hex_colors):
         r, g, b = hex_to_rgb(hex_code)
@@ -77,186 +91,149 @@ def generate_clr_content(hex_colors):
     return content
 
 # ==========================================
-# 2. 状态管理 (实现删除/移动的关键)
+# 2. 状态管理
 # ==========================================
+if 'palette' not in st.session_state:
+    st.session_state.palette = []
+if 'img_key' not in st.session_state:
+    st.session_state.img_key = None
 
-def init_session():
-    if 'palette' not in st.session_state:
-        st.session_state.palette = []
-    if 'img_id' not in st.session_state:
-        st.session_state.img_id = None
+def update_color(idx, new_color):
+    st.session_state.palette[idx] = new_color
 
-# 回调：删除颜色
-def delete_color(index):
-    if 0 <= index < len(st.session_state.palette):
-        st.session_state.palette.pop(index)
-
-# 回调：左移颜色
-def move_left(index):
-    if index > 0:
-        lst = st.session_state.palette
-        lst[index], lst[index-1] = lst[index-1], lst[index]
-
-# 回调：右移颜色
-def move_right(index):
-    if index < len(st.session_state.palette) - 1:
-        lst = st.session_state.palette
-        lst[index], lst[index+1] = lst[index+1], lst[index]
-
-# 回调：手动更新颜色值
-def update_color_value(index, new_color):
-    st.session_state.palette[index] = new_color
+def remove_color(idx):
+    st.session_state.palette.pop(idx)
 
 # ==========================================
-# 3. 页面布局
+# 3. 页面 UI
 # ==========================================
-
-st.set_page_config(page_title="GIS Gradient Pro", page_icon="🎨", layout="wide")
-init_session()
+st.set_page_config(page_title="GIS Smart Palette", page_icon="🎨", layout="wide")
 
 st.markdown("""
 <style>
-    .gradient-bar {
-        width: 100%; height: 60px; border-radius: 8px; margin: 20px 0;
-        border: 1px solid #ddd; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    /* 样式微调：让预览条更好看 */
+    .preview-bar {
+        width: 100%; height: 80px; border-radius: 12px; margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1); border: 2px solid #fff;
     }
-    .control-btn { padding: 0px 5px !important; }
+    /* 紧凑的控制区 */
+    .control-area { background-color: #f7f9fc; padding: 15px; border-radius: 10px; margin-bottom: 20px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎨 图片主题色提取 & 智能编辑器")
-st.markdown("上传图片 -> 智能提取 -> **手动拖拽/删除/微调** -> 下载 GIS 色带")
+st.title("🎨 GIS 智能色带提取器")
 
-# --- 侧边栏：提取设置 ---
+# --- 侧边栏：上传与提取参数 ---
 with st.sidebar:
-    st.header("1. 提取设置")
-    uploaded_file = st.file_uploader("上传图片", type=['jpg', 'jpeg', 'png'])
-    
-    n_colors = st.slider("提取数量", 3, 12, 7)
-    ignore_dull = st.checkbox("智能过滤背景 (去除灰/黑/白)", value=True, help="尝试忽略大面积的无聊背景色，只保留鲜艳的主题色")
-    
-    extract_btn = st.button("🚀 开始提取 / 重置", type="primary", use_container_width=True)
+    st.header("1. 上传与提取")
+    uploaded_file = st.file_uploader("上传图片 (电影截图 / 色卡图)", type=['jpg', 'png', 'jpeg'])
     
     st.divider()
-    st.header("2. 自动排序 (可选)")
-    sort_mode = st.selectbox("一键重排", ["不排序 (手动调整)", "亮度 (暗 -> 亮)", "亮度 (亮 -> 暗)", "色相 (光谱顺序)"])
-    if st.button("应用排序"):
-        if st.session_state.palette:
-            st.session_state.palette = auto_sort_colors(st.session_state.palette, sort_mode)
-            st.rerun()
+    st.subheader("🧪 智能提取参数")
+    st.info("👇 调整这里可以防止提取出黑色/灰色背景")
+    
+    n_colors = st.slider("提取颜色数量", 3, 12, 6)
+    min_sat = st.slider("最低饱和度 (去除灰/白)", 0.0, 1.0, 0.2, help="值越大，越只保留鲜艳颜色")
+    min_val = st.slider("最低亮度 (去除黑色)", 0.0, 1.0, 0.2, help="值越大，越只保留明亮颜色")
+    
+    extract_btn = st.button("🚀 重新提取", type="primary", use_container_width=True)
 
-    st.divider()
-    st.info("💡 提示：提取后，可以在右侧直接点击色块修改颜色，或使用下方按钮调整顺序。")
-
-# --- 主逻辑 ---
-
-# 1. 处理图片提取
+# --- 主逻辑处理 ---
 if uploaded_file:
-    # 检查是否是新图片或点击了提取按钮
-    file_id = uploaded_file.file_id if hasattr(uploaded_file, 'file_id') else uploaded_file.name
+    # 检查是否需要运行提取
+    file_id = f"{uploaded_file.name}-{n_colors}-{min_sat}-{min_val}"
     
-    if extract_btn or st.session_state.img_id != file_id:
+    if extract_btn or st.session_state.img_key != file_id:
         image = Image.open(uploaded_file)
-        with st.spinner("正在提取主题色..."):
-            new_colors = extract_colors_kmeans(image, n_colors, ignore_dull)
-            # 初始默认按亮度排序，体验更好
-            st.session_state.palette = auto_sort_colors(new_colors, "亮度 (暗 -> 亮)")
-            st.session_state.img_id = file_id
+        with st.spinner("正在智能分析色彩..."):
+            # 运行核心提取算法
+            new_colors = extract_smart_colors(image, n_colors, min_sat, min_val)
+            # 默认给一个亮度排序，因为乱序的渐变通常不好看
+            st.session_state.palette = sort_palette(new_colors, "brightness_asc")
+            st.session_state.img_key = file_id
 
-    # 显示原图 (限制高度，节省空间)
-    with st.expander("查看原图", expanded=False):
+    # 显示原图 (折叠状态，节省空间)
+    with st.expander("🖼️ 查看原始图片", expanded=False):
         st.image(uploaded_file, width=400)
 
-# 2. 核心交互区
+# --- 编辑器区域 ---
 if st.session_state.palette:
-    st.header("3. 色带编辑器")
     
-    # 实时预览条
-    current_colors = st.session_state.palette
-    if len(current_colors) > 1:
-        css = f"linear-gradient(to right, {', '.join(current_colors)})"
-        st.markdown(f'<div class="gradient-bar" style="background: {css};"></div>', unsafe_allow_html=True)
-    else:
-        st.warning("色带至少需要 2 个颜色")
+    # 1. 顶部：渐变预览
+    st.subheader("2. 渐变预览 (Real-time)")
+    css = f"linear-gradient(to right, {', '.join(st.session_state.palette)})"
+    st.markdown(f'<div class="preview-bar" style="background: {css};"></div>', unsafe_allow_html=True)
 
-    # 编辑网格
-    # 动态计算列数，每行显示 6 个
-    cols_per_row = 6
-    rows = [st.session_state.palette[i:i + cols_per_row] for i in range(0, len(st.session_state.palette), cols_per_row)]
+    # 2. 中部：快捷操作工具栏 (Smart Actions)
+    st.markdown('<div class="control-area">', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if st.button("✨ 按亮度排序 (暗→亮)", use_container_width=True):
+            st.session_state.palette = sort_palette(st.session_state.palette, "brightness_asc")
+            st.rerun()
+    with c2:
+        if st.button("✨ 按色相排序 (彩虹)", use_container_width=True):
+            st.session_state.palette = sort_palette(st.session_state.palette, "hue")
+            st.rerun()
+    with c3:
+        if st.button("🔄 顺序反转", use_container_width=True):
+            st.session_state.palette = sort_palette(st.session_state.palette, "reverse")
+            st.rerun()
+    with c4:
+        st.caption("👆 点击按钮可快速调整渐变逻辑，无需手动一个个拖拽。")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 3. 底部：精细调整 (颜色选择 + 删除)
+    st.subheader("3. 颜色微调")
     
-    global_idx = 0
-    for row in rows:
-        cols = st.columns(cols_per_row)
-        for idx, color in enumerate(row):
-            with cols[idx]:
-                # 1. 颜色选择器 (兼具展示和修改功能)
-                new_col = st.color_picker(
-                    f"色点 {global_idx+1}", 
-                    value=color, 
-                    key=f"cp_{global_idx}",
-                    label_visibility="collapsed"
-                )
-                
-                # 如果用户修改了颜色选择器，更新状态
-                if new_col != color:
-                    update_color_value(global_idx, new_col)
-                    st.rerun()
-
-                # 2. 控制按钮组
-                b1, b2, b3 = st.columns([1, 1, 1])
-                with b1:
-                    # 左移
-                    if global_idx > 0:
-                        st.button("⬅️", key=f"l_{global_idx}", on_click=move_left, args=(global_idx,), help="左移")
-                    else:
-                        st.write("") # 占位
-                with b2:
-                    # 删除
-                    st.button("❌", key=f"d_{global_idx}", on_click=delete_color, args=(global_idx,), help="删除此颜色")
-                with b3:
-                    # 右移
-                    if global_idx < len(st.session_state.palette) - 1:
-                        st.button("➡️", key=f"r_{global_idx}", on_click=move_right, args=(global_idx,), help="右移")
+    # 动态布局：每行6个
+    cols = st.columns(6)
+    for i, color in enumerate(st.session_state.palette):
+        col = cols[i % 6]
+        with col:
+            # 颜色选择器 (修改颜色)
+            new_val = st.color_picker(f"C{i+1}", color, key=f"cp_{i}", label_visibility="collapsed")
+            if new_val != color:
+                update_color(i, new_val)
+                st.rerun()
             
-            global_idx += 1
+            # 删除按钮 (红色小垃圾桶)
+            if st.button("🗑️", key=f"del_{i}", help="删除此颜色"):
+                remove_color(i)
+                st.rerun()
 
     st.divider()
 
-    # 4. 下载区
-    st.header("4. 导出结果")
-    c1, c2 = st.columns(2)
+    # 4. 导出
+    st.subheader("4. 导出结果")
+    d1, d2 = st.columns(2)
     
-    filename = "extracted_palette"
-    if uploaded_file:
-        filename = uploaded_file.name.split('.')[0]
-
-    with c1:
-        # 下载 CLR
-        clr_data = generate_clr_content(st.session_state.palette)
+    base_name = uploaded_file.name.split('.')[0]
+    
+    with d1:
         st.download_button(
-            label="📄 下载 ArcGIS (.clr)",
-            data=clr_data,
-            file_name=f"{filename}.clr",
+            label="📄 下载 ArcGIS .clr 文件",
+            data=generate_clr(st.session_state.palette),
+            file_name=f"{base_name}_gradient.clr",
             mime="text/plain",
             type="primary",
             use_container_width=True
         )
-
-    with c2:
-        # 下载 JSON
-        json_data = [{
-            "name": filename,
+    
+    with d2:
+        # JSON 备份
+        json_struct = [{
+            "name": base_name,
             "category": "Extracted",
-            "tags": ["User Image"],
             "colors": st.session_state.palette
         }]
         st.download_button(
-            label="📦 下载 JSON (用于备份)",
-            data=json.dumps(json_data, indent=2),
-            file_name=f"{filename}.json",
+            label="📦 下载 JSON 配置",
+            data=json.dumps(json_struct, indent=2),
+            file_name=f"{base_name}.json",
             mime="application/json",
             use_container_width=True
         )
 
 else:
-    st.info("👈 请在左侧上传图片开始提取")
+    st.info("👋 请在左侧上传图片。可以是电影截图，也可以是那种一排颜色的色卡图。")
